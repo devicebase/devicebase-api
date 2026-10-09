@@ -174,6 +174,7 @@ curl -s "$BASE/v1/devices?type=browser&state=free&limit=10" \
       "location": "Beijing",
       "operator": "CMCC",
       "network": "wifi",
+      "is_cloud": false,
       "updated_at": "2026-09-20T15:11:31"
     }
   ]
@@ -193,6 +194,7 @@ curl -s "$BASE/v1/devices?type=browser&state=free&limit=10" \
 | `os_type` / `os_version` | string | 操作系统与版本，`type` 的系统类型过滤依据 |
 | `display` | string | 分辨率，如 `1470x956` |
 | `location` / `operator` / `network` | string | 位置、运营商、网络类型 |
+| `is_cloud` | bool | 是否是**云浏览器**（平台在你的集群配额里替你建的那一种）。自己接进来的浏览器 `type` 同样是 `browser`，只有这个字段能把两者分开 —— 云浏览器才计入配额，也只有它能用下面的删除接口 |
 | `updated_at` | string | 最后更新时间，**无时区偏移**（本地时间） |
 
 > 该响应**没有 `trace_id`、`timestamp`、分页字段**，`data` 直接是设备数组。
@@ -444,6 +446,102 @@ curl -s "$BASE/api/browser/$SERIALNO/state" -H "Authorization: Bearer $DEVICEBAS
 ### Screenshot
 
 browser 的截图同样使用跨平台的 `POST /v1/screen/{serialno}`（见上文）。
+
+---
+
+## 云浏览器
+
+上面那些接口驱动的是一台**已经存在**的浏览器。这一组**创建与销毁**浏览器本身，走
+`/v1/browser/*`，路径里没有 `serialno` —— 创建的那一刻它还没有。
+
+「云浏览器」是平台在自己的集群上替你跑的那一种。你自己接进来的 Chrome 不是：它不计入
+配额，也不能用这里的删除接口（设备列表的 `is_cloud` 把两者分开）。
+
+| 接口 | 方法 | 路径 | 请求体 |
+|------|------|------|--------|
+| Quota | GET | `/v1/browser/quota` | 无 |
+| Create | POST | `/v1/browser/create` | `{"name"?: string, "window_size"?: string, "wait_seconds"?: int}`（`name` 落到 `alias_name`） |
+| Status | GET | `/v1/browser/{device_sn\|serialno}/status` | 无 |
+| Delete | DELETE | `/v1/browser/{device_sn\|serialno}` | 无 |
+
+**Create** —— 平台自己选址、自己签发授权凭据、自己派发给集群节点，调用方不选机器，也不会
+被告知落在哪一台。字段全部可选（显式的 `null` 与不传同义）；`window_size` 形如 `1366x768`；
+`name` 最长 100 字符，不传则由平台的命名规则生成。
+
+云浏览器**恒为 headless**：它跑在没有人看着的集群机器上，没有显示器可开窗口。所以没有
+`headless` 字段 —— 传 `headless: false` 会被拒（400）而不是被忽略，静默忽略会让调用方以为
+窗口被关掉了。
+
+```bash
+curl -s "$BASE/v1/browser/create" -X POST \
+  -H "Authorization: Bearer $DEVICEBASE_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"my-browser","window_size":"1366x768"}'
+```
+
+```json
+{"code": 200, "message": "success",
+ "data": {"device_sn": "3f2a1b4c-0000-1111-2222-333344445555",
+          "serialno": "db-mtabc123",
+          "name": "Browser-3f2a1b4c",
+          "alias_name": "my-browser",
+          "registered": true},
+ "trace_id": null}
+```
+
+响应里有两个「名字」，别混：
+
+| 字段 | 是什么 |
+|------|--------|
+| `name` | 平台的内部身份名，恒为 `Browser-` + serial 前 8 位。不由调用方决定，也不随节点变化 |
+| `alias_name` | **你要的那个名字**，原样返回（没传就是 `null`）。它在创建时由平台定下来，之后每一次重新注册都不会改写它 |
+
+之所以要分开：节点给自己的实例起名时会补上端口（`<请求名>-<端口>`，用于同机多实例去重），
+那是它对内的称呼。若把它写进设备行，用户给的名字会在创建十几秒后自己变成
+`my-browser-37377` 这样 —— 所以名字随授权凭据一起送到节点、再原样带回来，落进
+`alias_name`；`name` 始终是平台的身份名。控制台显示的也是 `alias_name`（为空时回退到 `name`）。
+
+**创建是异步的**（浏览器要启动，并在下一次注册里把设备报上来），所以这条接口会**等它注册**，
+好把调用方真正要用的那个键 —— `serialno` —— 一并交出去。等多久由 `wait_seconds` 决定：
+`0`–`60`，不传时服务端默认 15；`0` 表示立刻返回（批量创建时用）。
+
+等不到**不是失败**：`registered` 为 `false`、`serialno` 为 `null`，同时给出一个仍然有效的
+`device_sn`（`/status` 与删除接口都认它）。慢不等于坏 —— 机器可能在冷启动、可能正在下载
+Chromium；把这个过程报成错误会诱使调用方重试，而重试会建出第二台浏览器、占掉第二个配额。
+
+> 这条接口因此是唯一**会阻塞**的：服务端最坏情况 = 派发（20s）+ 等待（`wait_seconds`）。
+> 客户端的 HTTP 期限要按这个量级放宽，别用默认的 30s。
+
+**Status** —— 那件事发生了没有。`registered: false` 是**正常答案，不是错误**（HTTP 200），
+所以轮询它是安静的；注册之后同时给出 `serialno`、`name`、`alias_name`、`state` 与 `server_url`。
+按 `device_sn`（创建返回的）或 `serialno` 查都可以，只查本人的设备。
+
+```bash
+curl -s "$BASE/v1/browser/3f2a1b4c-0000-1111-2222-333344445555/status" \
+  -H "Authorization: Bearer $DEVICEBASE_API_KEY"
+```
+
+**Quota** —— 还能建几台，`{"limit":10,"used":3,"remaining":7}`。与创建时的校验同源，
+所以它给出的数不会与创建的结果打架；只有云浏览器计入，「已用」不含自己接进来的设备。
+
+**Delete** —— 立碑、入回收队列、软删，**不可恢复**，且与 `close` 不是一回事（`close` 只是
+停掉 CDP 引擎，浏览器还在）。它**不等节点**：指令先落库，节点下一拍心跳领走，所以节点离线
+时删除照样成功，创建刚返回（`registered: false`）时也删得掉。标识可以是 `serialno`，
+也可以是创建返回的 `device_sn`。
+
+```bash
+curl -s "$BASE/v1/browser/db-mtabc123" -X DELETE -H "Authorization: Bearer $DEVICEBASE_API_KEY"
+```
+
+失败时按 HTTP 状态码区分**该不该重试**：
+
+| 状态码 | 含义 | 重试 |
+|--------|------|------|
+| `400` | 参数形状不对（如 `window_size` 不是 `WxH`） | 改参数 |
+| `404` | 不存在 / 不属于你 / 已经被删（三者同一个回答，避免成为探测别人设备的探针） | 否 |
+| `409` | 配额已满（创建），或这台不是云浏览器（删除） | 否 —— 删掉不用的，或找管理员调上限 |
+| `502` | 平台与云节点之间的鉴权没通过（签名 / 密钥 / 时钟） | 否 —— 需要人处理 |
+| `503` | 当前没有可用节点，或联系不上选中的节点 | 是，稍后重试 |
 
 ---
 
