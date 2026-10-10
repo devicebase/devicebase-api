@@ -545,6 +545,79 @@ curl -s "$BASE/v1/browser/db-mtabc123" -X DELETE -H "Authorization: Bearer $DEVI
 
 ---
 
+## 账号
+
+上面每一组接口都以**一台设备**为对象（或平台替你创建的浏览器）。这一组问的是**账号自己**：
+调用方的 API Key 属于谁、积分还有多少、今天签到了没有。走 `/v1/user/*`，路径里**没有用户标识**
+—— 查谁由 Key 决定，因此只可能查到自己，不存在越权读取的口子。
+
+| 接口 | 方法 | 路径 | 请求体 |
+|------|------|------|--------|
+| Info | GET | `/v1/user/info` | 无 |
+| Checkin | POST | `/v1/user/checkin` | 无（空体也可，见下） |
+
+**Info** —— 返回姓名（`username`，控制台里显示的那个人名）、电话（`mobile`）、积分余额
+（`credits`）、注册时间（`registered_at`），以及 `can_checkin`：今天还能不能签到。
+
+```bash
+curl -s "$BASE/v1/user/info" -H "Authorization: Bearer $DEVICEBASE_API_KEY"
+```
+
+```json
+{
+  "code": 200,
+  "message": "success",
+  "data": {
+    "id": 42,
+    "username": "richie",
+    "mobile": "13800138000",
+    "credits": 1259,
+    "registered_at": "2026-01-02T03:04:05",
+    "can_checkin": true
+  }
+}
+```
+
+**Checkin** —— 每日签到领积分：第一天 25 分，之后每连续一天多 10 分，每天最高 95 分。
+中间断一天则从 25 分重新开始。奖励在当天首次签到时一次性入账（同时写一条
+`reward_daily_login` 的积分流水）。
+
+```bash
+curl -s "$BASE/v1/user/checkin" -X POST -H "Authorization: Bearer $DEVICEBASE_API_KEY"
+```
+
+```json
+{
+  "code": 200,
+  "message": "success",
+  "data": {
+    "success": true,
+    "credits_earned": 25,
+    "consecutive_days": 1,
+    "already_checked": false,
+    "message": "签到成功！获得25积分",
+    "credits": 1284
+  }
+}
+```
+
+**当天重复签到不是错误**：第二次（以及之后每一次）返回 HTTP 200、`already_checked: true`、
+`credits_earned: 0`，`message` 为「今日已签到」，不会重复发分。这正是它可以放进**每日定时任务**
+的原因 —— 任务不需要先问 `can_checkin`，也不需要担心触发两次：
+
+```bash
+# crontab -e —— 每天 09:07
+7 9 * * * DEVICEBASE_API_KEY=sk-… devicebase user checkin >> ~/devicebase-checkin.log 2>&1
+```
+
+`data.success` 与 `data.already_checked` 是给程序判断的，`data.message` 是平台自己的说法
+（控制台直接展示这一句），两者都在，调用方不必自己拼文案。
+
+签到接口没有请求体参数。带上 `content-type: application/json` 的**空体**同样接受 ——
+curl 与各语言 SDK 的常见写法，判成 JSON 解析失败会让一次合法的签到变成 400。
+
+---
+
 ## 设备控制 - 电脑
 
 路径模板：`POST/GET /api/computer/{serialno}/{action}`。`serialno` 取自 `list-devices --type computer`。坐标为**屏幕绝对像素**。
